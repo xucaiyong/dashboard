@@ -1,4 +1,4 @@
-// Copyright 2015 Google Inc. All Rights Reserved.
+// Copyright 2017 The Kubernetes Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,47 +18,52 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/kubernetes/dashboard/src/app/backend/resource/common"
+	"github.com/kubernetes/dashboard/src/app/backend/api"
+	"k8s.io/api/core/v1"
 	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	api "k8s.io/client-go/pkg/api/v1"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 func TestGetPersistentVolumeDetail(t *testing.T) {
-
 	cases := []struct {
-		persistentVolumes *api.PersistentVolume
-		expected          *PersistentVolumeDetail
+		name             string
+		persistentVolume *v1.PersistentVolume
+		expected         *PersistentVolumeDetail
 	}{
 		{
-			&api.PersistentVolume{
+			"foo",
+			&v1.PersistentVolume{
 				ObjectMeta: metaV1.ObjectMeta{Name: "foo"},
-				Spec: api.PersistentVolumeSpec{
-					PersistentVolumeReclaimPolicy: api.PersistentVolumeReclaimRecycle,
-					AccessModes:                   []api.PersistentVolumeAccessMode{api.ReadWriteOnce},
+				Spec: v1.PersistentVolumeSpec{
+					PersistentVolumeReclaimPolicy: v1.PersistentVolumeReclaimRecycle,
+					AccessModes:                   []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
 					Capacity:                      nil,
-					ClaimRef:                      &api.ObjectReference{Name: "myclaim-name"},
-					PersistentVolumeSource: api.PersistentVolumeSource{
-						HostPath: &api.HostPathVolumeSource{
+					ClaimRef: &v1.ObjectReference{
+						Name:      "myclaim-name",
+						Namespace: "default",
+					},
+					PersistentVolumeSource: v1.PersistentVolumeSource{
+						HostPath: &v1.HostPathVolumeSource{
 							Path: "my-path",
 						},
 					},
 				},
-				Status: api.PersistentVolumeStatus{
-					Phase:   api.VolumePending,
+				Status: v1.PersistentVolumeStatus{
+					Phase:   v1.VolumePending,
 					Message: "my-message",
 				},
 			},
 			&PersistentVolumeDetail{
-				TypeMeta:      common.TypeMeta{Kind: "persistentvolume"},
-				ObjectMeta:    common.ObjectMeta{Name: "foo"},
-				Status:        api.VolumePending,
-				ReclaimPolicy: api.PersistentVolumeReclaimRecycle,
-				AccessModes:   []api.PersistentVolumeAccessMode{api.ReadWriteOnce},
+				TypeMeta:      api.TypeMeta{Kind: "persistentvolume"},
+				ObjectMeta:    api.ObjectMeta{Name: "foo"},
+				Status:        v1.VolumePending,
+				ReclaimPolicy: v1.PersistentVolumeReclaimRecycle,
+				AccessModes:   []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
 				Capacity:      nil,
-				Claim:         "myclaim-name",
+				Claim:         "default/myclaim-name",
 				Message:       "my-message",
-				PersistentVolumeSource: api.PersistentVolumeSource{
-					HostPath: &api.HostPathVolumeSource{
+				PersistentVolumeSource: v1.PersistentVolumeSource{
+					HostPath: &v1.HostPathVolumeSource{
 						Path: "my-path",
 					},
 				},
@@ -66,10 +71,17 @@ func TestGetPersistentVolumeDetail(t *testing.T) {
 		},
 	}
 	for _, c := range cases {
-		actual := getPersistentVolumeDetail(c.persistentVolumes)
+		fakeClient := fake.NewSimpleClientset(c.persistentVolume)
+
+		actual, err := GetPersistentVolumeDetail(fakeClient, c.name)
+
+		if err != nil {
+			t.Errorf("GetPersistentVolumeDetail(%#v) == \ngot err %#v", c.persistentVolume, err)
+		}
+
 		if !reflect.DeepEqual(actual, c.expected) {
-			t.Errorf("getPersistentVolumeDetail(%#v) == \n%#v\nexpected \n%#v\n",
-				c.persistentVolumes, actual, c.expected)
+			t.Errorf("GetPersistentVolumeDetail(%#v) == \n%#v\nexpected \n%#v\n",
+				c.persistentVolume, actual, c.expected)
 		}
 	}
 }

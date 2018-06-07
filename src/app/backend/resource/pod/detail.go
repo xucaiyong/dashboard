@@ -1,4 +1,4 @@
-// Copyright 2015 Google Inc. All Rights Reserved.
+// Copyright 2017 The Kubernetes Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,75 +15,45 @@
 package pod
 
 import (
-	"encoding/json"
+	"encoding/base64"
+	"fmt"
 	"log"
+	"math"
+	"strconv"
 
-	"github.com/kubernetes/dashboard/src/app/backend/client"
+	"github.com/kubernetes/dashboard/src/app/backend/api"
+	errorHandler "github.com/kubernetes/dashboard/src/app/backend/errors"
+	metricapi "github.com/kubernetes/dashboard/src/app/backend/integration/metric/api"
 	"github.com/kubernetes/dashboard/src/app/backend/resource/common"
-	daemonsetlist "github.com/kubernetes/dashboard/src/app/backend/resource/daemonset/list"
+	"github.com/kubernetes/dashboard/src/app/backend/resource/controller"
 	"github.com/kubernetes/dashboard/src/app/backend/resource/dataselect"
-	joblist "github.com/kubernetes/dashboard/src/app/backend/resource/job/list"
-	"github.com/kubernetes/dashboard/src/app/backend/resource/metric"
-	replicasetlist "github.com/kubernetes/dashboard/src/app/backend/resource/replicaset/list"
-	replicationcontrollerlist "github.com/kubernetes/dashboard/src/app/backend/resource/replicationcontroller/list"
-	statefulsetlist "github.com/kubernetes/dashboard/src/app/backend/resource/statefulset/list"
+	"github.com/kubernetes/dashboard/src/app/backend/resource/persistentvolumeclaim"
+	"k8s.io/api/core/v1"
+	res "k8s.io/apimachinery/pkg/api/resource"
 	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	k8sClient "k8s.io/client-go/kubernetes"
-	api "k8s.io/client-go/pkg/api/v1"
-	apps "k8s.io/client-go/pkg/apis/apps/v1beta1"
-	batch "k8s.io/client-go/pkg/apis/batch/v1"
-	extensions "k8s.io/client-go/pkg/apis/extensions/v1beta1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 )
 
-// PodDetail is a presentation layer view of Kubernetes PodDetail resource.
-// This means it is PodDetail plus additional augmented data we can get
-// from other sources (like services that target it).
+// PodDetail is a presentation layer view of Kubernetes Pod resource.
 type PodDetail struct {
-	ObjectMeta common.ObjectMeta `json:"objectMeta"`
-	TypeMeta   common.TypeMeta   `json:"typeMeta"`
+	ObjectMeta                api.ObjectMeta                                  `json:"objectMeta"`
+	TypeMeta                  api.TypeMeta                                    `json:"typeMeta"`
+	PodPhase                  v1.PodPhase                                     `json:"podPhase"`
+	PodIP                     string                                          `json:"podIP"`
+	NodeName                  string                                          `json:"nodeName"`
+	RestartCount              int32                                           `json:"restartCount"`
+	QOSClass                  string                                          `json:"qosClass"`
+	Controller                controller.ResourceOwner                        `json:"controller"`
+	Containers                []Container                                     `json:"containers"`
+	InitContainers            []Container                                     `json:"initContainers"`
+	Metrics                   []metricapi.Metric                              `json:"metrics"`
+	Conditions                []common.Condition                              `json:"conditions"`
+	EventList                 common.EventList                                `json:"eventList"`
+	PersistentvolumeclaimList persistentvolumeclaim.PersistentVolumeClaimList `json:"persistentVolumeClaimList"`
 
-	// Status of the Pod. See Kubernetes API for reference.
-	PodPhase api.PodPhase `json:"podPhase"`
-
-	// IP address of the Pod.
-	PodIP string `json:"podIP"`
-
-	// Name of the Node this Pod runs on.
-	NodeName string `json:"nodeName"`
-
-	// Count of containers restarts.
-	RestartCount int32 `json:"restartCount"`
-
-	// Reference to the Controller
-	Controller Controller `json:"controller"`
-
-	// List of container of this pod.
-	Containers []Container `json:"containers"`
-
-	// Metrics collected for this resource
-	Metrics []metric.Metric `json:"metrics"`
-
-	// Conditions of this pod.
-	Conditions []common.Condition `json:"conditions"`
-
-	// Events is list of events associated with a pod.
-	EventList common.EventList `json:"eventList"`
-}
-
-// Creator is a view of the creator of a given pod, in List for for ease of use
-// in the frontend logic.
-//
-// Has 'oneof' semantics on the non-Kind fields decided by which Kind is there
-// TODO(maciaszczykm): Refactor.
-type Controller struct {
-	// Kind of the Controller, will also define wich of the other members will be non nil
-	Kind string `json:"kind"`
-
-	JobList                   *joblist.JobList                                     `json:"joblist,omitempty"`
-	ReplicaSetList            *replicasetlist.ReplicaSetList                       `json:"replicasetlist,omitempty"`
-	ReplicationControllerList *replicationcontrollerlist.ReplicationControllerList `json:"replicationcontrollerlist,omitempty"`
-	DaemonSetList             *daemonsetlist.DaemonSetList                         `json:"daemonsetlist,omitempty"`
-	StatefulSetList           *statefulsetlist.StatefulSetList                     `json:"statefulsetlist,omitempty"`
+	// List of non-critical errors, that occurred during resource retrieval.
+	Errors []error `json:"errors"`
 }
 
 // Container represents a docker/rkt/etc. container that lives in a pod.
@@ -115,173 +85,100 @@ type EnvVar struct {
 	// Defined for derived variables. If non-null, the value is get from the reference.
 	// Note that this is an API struct. This is intentional, as EnvVarSources are plain struct
 	// references.
-	ValueFrom *api.EnvVarSource `json:"valueFrom"`
+	ValueFrom *v1.EnvVarSource `json:"valueFrom"`
 }
 
-// GetPodDetail returns the details (PodDetail) of a named Pod from a particular
-// namespace.
-func GetPodDetail(client k8sClient.Interface, heapsterClient client.HeapsterClient, namespace, name string) (*PodDetail, error) {
-
+// GetPodDetail returns the details of a named Pod from a particular namespace.
+func GetPodDetail(client kubernetes.Interface, metricClient metricapi.MetricClient, namespace, name string) (
+	*PodDetail, error) {
 	log.Printf("Getting details of %s pod in %s namespace", name, namespace)
 
 	channels := &common.ResourceChannels{
 		ConfigMapList: common.GetConfigMapListChannel(client, common.NewSameNamespaceQuery(namespace), 1),
-		PodMetrics:    common.GetPodMetricsChannel(heapsterClient, name, namespace),
+		SecretList:    common.GetSecretListChannel(client, common.NewSameNamespaceQuery(namespace), 1),
 	}
 
-	pod, err := client.Core().Pods(namespace).Get(name, metaV1.GetOptions{})
-
+	pod, err := client.CoreV1().Pods(namespace).Get(name, metaV1.GetOptions{})
 	if err != nil {
 		return nil, err
 	}
 
-	controller := Controller{
-		Kind: "unknown",
-	}
-	creatorAnnotation, found := pod.ObjectMeta.Annotations[api.CreatedByAnnotation]
-	if found {
-		creatorRef, err := getPodCreator(client, creatorAnnotation, common.NewSameNamespaceQuery(namespace), heapsterClient)
-		if err != nil {
-			return nil, err
-		}
-		controller = *creatorRef
+	controller, err := getPodController(client, common.NewSameNamespaceQuery(namespace), pod)
+	nonCriticalErrors, criticalError := errorHandler.HandleError(err)
+	if criticalError != nil {
+		return nil, criticalError
 	}
 
-	// Download metrics
-	_, metricPromises := dataselect.GenericDataSelectWithMetrics(toCells([]api.Pod{*pod}),
-		dataselect.StdMetricsDataSelect, dataselect.NoResourceCache, &heapsterClient)
+	_, metricPromises := dataselect.GenericDataSelectWithMetrics(toCells([]v1.Pod{*pod}),
+		dataselect.StdMetricsDataSelect, metricapi.NoResourceCache, metricClient)
 	metrics, _ := metricPromises.GetMetrics()
 
-	if err = <-channels.ConfigMapList.Error; err != nil {
-		return nil, err
-	}
 	configMapList := <-channels.ConfigMapList.List
+	err = <-channels.ConfigMapList.Error
+	nonCriticalErrors, criticalError = errorHandler.AppendError(err, nonCriticalErrors)
+	if criticalError != nil {
+		return nil, criticalError
+	}
+
+	secretList := <-channels.SecretList.List
+	err = <-channels.SecretList.Error
+	nonCriticalErrors, criticalError = errorHandler.AppendError(err, nonCriticalErrors)
+	if criticalError != nil {
+		return nil, criticalError
+	}
 
 	eventList, err := GetEventsForPod(client, dataselect.DefaultDataSelect, pod.Namespace, pod.Name)
-	if err != nil {
-		return nil, err
+	nonCriticalErrors, criticalError = errorHandler.AppendError(err, nonCriticalErrors)
+	if criticalError != nil {
+		return nil, criticalError
 	}
 
-	podDetail := toPodDetail(pod, metrics, configMapList, controller, eventList)
+	persistentVolumeClaimList, err := persistentvolumeclaim.GetPodPersistentVolumeClaims(client,
+		namespace, name, dataselect.DefaultDataSelect)
+	nonCriticalErrors, criticalError = errorHandler.AppendError(err, nonCriticalErrors)
+	if criticalError != nil {
+		return nil, criticalError
+	}
+
+	podDetail := toPodDetail(pod, metrics, configMapList, secretList, controller,
+		eventList, persistentVolumeClaimList, nonCriticalErrors)
 	return &podDetail, nil
 }
 
-func getPodCreator(client k8sClient.Interface, creatorAnnotation string, nsQuery *common.NamespaceQuery, heapsterClient client.HeapsterClient) (*Controller, error) {
-	var serializedReference api.SerializedReference
-	err := json.Unmarshal([]byte(creatorAnnotation), &serializedReference)
-	if err != nil {
-		return nil, err
-	}
+func getPodController(client kubernetes.Interface, nsQuery *common.NamespaceQuery, pod *v1.Pod) (
+	ctrl controller.ResourceOwner, err error) {
 
 	channels := &common.ResourceChannels{
 		PodList:   common.GetPodListChannel(client, nsQuery, 1),
 		EventList: common.GetEventListChannel(client, nsQuery, 1),
 	}
+
 	pods := <-channels.PodList.List
-	if err := <-channels.PodList.Error; err != nil {
-		return nil, err
+	err = <-channels.PodList.Error
+	if err != nil {
+		return
 	}
 
 	events := <-channels.EventList.List
 	if err := <-channels.EventList.Error; err != nil {
-		return nil, err
+		events = &v1.EventList{}
 	}
-	reference := serializedReference.Reference
-	return toPodController(client, reference, pods.Items, events.Items, heapsterClient)
+
+	ownerRef := metaV1.GetControllerOf(pod)
+	if ownerRef != nil {
+		var rc controller.ResourceController
+		rc, err = controller.NewResourceController(*ownerRef, pod.Namespace, client)
+		if err == nil {
+			ctrl = rc.Get(pods.Items, events.Items)
+		}
+	}
+
+	return
 }
 
-func toPodController(client k8sClient.Interface, reference api.ObjectReference, pods []api.Pod, events []api.Event, heapsterClient client.HeapsterClient) (*Controller, error) {
-	kind := reference.Kind
-	switch kind {
-	case "Job":
-		return toJobPodController(client, reference, pods, events, heapsterClient)
-	case "ReplicaSet":
-		return toReplicaSetPodController(client, reference, pods, events, heapsterClient)
-	case "ReplicationController":
-		return toReplicationControllerPodController(client, reference, pods, events, heapsterClient)
-	case "DaemonSet":
-		return toDaemonSetPodController(client, reference, pods, events, heapsterClient)
-	case "StatefulSet":
-		return toStatefulSetPodController(client, reference, pods, events, heapsterClient)
-	default:
-	}
-	// Will be moved into the default case once all cases are implemented
-	return &Controller{
-		Kind: kind,
-	}, nil
-}
-
-func toJobPodController(client k8sClient.Interface, reference api.ObjectReference, pods []api.Pod, events []api.Event, heapsterClient client.HeapsterClient) (*Controller, error) {
-	job, err := client.Batch().Jobs(reference.Namespace).Get(reference.Name, metaV1.GetOptions{})
-	if err != nil {
-		return nil, err
-	}
-	jobs := []batch.Job{*job}
-	jobList := joblist.CreateJobList(jobs, pods, events, dataselect.StdMetricsDataSelect, &heapsterClient)
-	return &Controller{
-		Kind:    "Job",
-		JobList: jobList,
-	}, nil
-}
-
-func toReplicaSetPodController(client k8sClient.Interface, reference api.ObjectReference, pods []api.Pod, events []api.Event, heapsterClient client.HeapsterClient) (*Controller, error) {
-	rs, err := client.Extensions().ReplicaSets(reference.Namespace).Get(reference.Name, metaV1.GetOptions{})
-	if err != nil {
-		return nil, err
-	}
-	replicaSets := []extensions.ReplicaSet{*rs}
-	replicaSetList := replicasetlist.CreateReplicaSetList(replicaSets, pods, events, dataselect.StdMetricsDataSelect, &heapsterClient)
-	return &Controller{
-		Kind:           "ReplicaSet",
-		ReplicaSetList: replicaSetList,
-	}, nil
-}
-
-func toReplicationControllerPodController(client k8sClient.Interface, reference api.ObjectReference, pods []api.Pod, events []api.Event, heapsterClient client.HeapsterClient) (*Controller, error) {
-	rc, err := client.Core().ReplicationControllers(reference.Namespace).Get(reference.Name, metaV1.GetOptions{})
-	if err != nil {
-		return nil, err
-	}
-	rcs := []api.ReplicationController{*rc}
-	replicationControllerList := replicationcontrollerlist.CreateReplicationControllerList(rcs, dataselect.StdMetricsDataSelect, pods, events, &heapsterClient)
-	return &Controller{
-		Kind: "ReplicationController",
-		ReplicationControllerList: replicationControllerList,
-	}, nil
-}
-
-func toDaemonSetPodController(client k8sClient.Interface, reference api.ObjectReference, pods []api.Pod, events []api.Event, heapsterClient client.HeapsterClient) (*Controller, error) {
-	daemonset, err := client.Extensions().DaemonSets(reference.Namespace).Get(reference.Name, metaV1.GetOptions{})
-	if err != nil {
-		return nil, err
-	}
-	daemonsets := []extensions.DaemonSet{*daemonset}
-
-	daemonSetList := daemonsetlist.CreateDaemonSetList(daemonsets, pods, events, dataselect.StdMetricsDataSelect, &heapsterClient)
-	return &Controller{
-		Kind:          "DaemonSet",
-		DaemonSetList: daemonSetList,
-	}, nil
-}
-
-func toStatefulSetPodController(client k8sClient.Interface, reference api.ObjectReference, pods []api.Pod, events []api.Event, heapsterClient client.HeapsterClient) (*Controller, error) {
-	statefulset, err := client.Apps().StatefulSets(reference.Namespace).Get(reference.Name, metaV1.GetOptions{})
-	if err != nil {
-		return nil, err
-	}
-	statefulsets := []apps.StatefulSet{*statefulset}
-
-	statefulSetList := statefulsetlist.CreateStatefulSetList(statefulsets, pods, events, dataselect.StdMetricsDataSelect, &heapsterClient)
-	return &Controller{
-		Kind:            "StatefulSet",
-		StatefulSetList: statefulSetList,
-	}, nil
-}
-
-func toPodDetail(pod *api.Pod, metrics []metric.Metric, configMaps *api.ConfigMapList, controller Controller, eventList *common.EventList) PodDetail {
-
+func extractContainerInfo(containerList []v1.Container, pod *v1.Pod, configMaps *v1.ConfigMapList, secrets *v1.SecretList) []Container {
 	containers := make([]Container, 0)
-	for _, container := range pod.Spec.Containers {
+	for _, container := range containerList {
 		vars := make([]EnvVar, 0)
 		for _, envVar := range container.Env {
 			variable := EnvVar{
@@ -290,10 +187,13 @@ func toPodDetail(pod *api.Pod, metrics []metric.Metric, configMaps *api.ConfigMa
 				ValueFrom: envVar.ValueFrom,
 			}
 			if variable.ValueFrom != nil {
-				variable.Value = evalValueFrom(variable.ValueFrom, configMaps)
+				variable.Value = evalValueFrom(variable.ValueFrom, &container, pod,
+					configMaps, secrets)
 			}
 			vars = append(vars, variable)
 		}
+		vars = append(vars, evalEnvFrom(container, configMaps, secrets)...)
+
 		containers = append(containers, Container{
 			Name:     container.Name,
 			Image:    container.Image,
@@ -302,32 +202,157 @@ func toPodDetail(pod *api.Pod, metrics []metric.Metric, configMaps *api.ConfigMa
 			Args:     container.Args,
 		})
 	}
-	podDetail := PodDetail{
-		ObjectMeta:   common.NewObjectMeta(pod.ObjectMeta),
-		TypeMeta:     common.NewTypeMeta(common.ResourceKindPod),
-		PodPhase:     pod.Status.Phase,
-		PodIP:        pod.Status.PodIP,
-		RestartCount: getRestartCount(*pod),
-		NodeName:     pod.Spec.NodeName,
-		Controller:   controller,
-		Containers:   containers,
-		Metrics:      metrics,
-		Conditions:   getPodConditions(*pod),
-		EventList:    *eventList,
-	}
-
-	return podDetail
+	return containers
 }
 
-func evalValueFrom(src *api.EnvVarSource, configMaps *api.ConfigMapList) string {
-	if src.ConfigMapKeyRef != nil {
-		name := src.ConfigMapKeyRef.LocalObjectReference.Name
+func toPodDetail(pod *v1.Pod, metrics []metricapi.Metric, configMaps *v1.ConfigMapList, secrets *v1.SecretList,
+	controller controller.ResourceOwner, events *common.EventList,
+	persistentVolumeClaimList *persistentvolumeclaim.PersistentVolumeClaimList, nonCriticalErrors []error) PodDetail {
+	return PodDetail{
+		ObjectMeta:                api.NewObjectMeta(pod.ObjectMeta),
+		TypeMeta:                  api.NewTypeMeta(api.ResourceKindPod),
+		PodPhase:                  pod.Status.Phase,
+		PodIP:                     pod.Status.PodIP,
+		RestartCount:              getRestartCount(*pod),
+		QOSClass:                  string(pod.Status.QOSClass),
+		NodeName:                  pod.Spec.NodeName,
+		Controller:                controller,
+		Containers:                extractContainerInfo(pod.Spec.Containers, pod, configMaps, secrets),
+		InitContainers:            extractContainerInfo(pod.Spec.InitContainers, pod, configMaps, secrets),
+		Metrics:                   metrics,
+		Conditions:                getPodConditions(*pod),
+		EventList:                 *events,
+		PersistentvolumeclaimList: *persistentVolumeClaimList,
+		Errors: nonCriticalErrors,
+	}
+}
 
+func evalEnvFrom(container v1.Container, configMaps *v1.ConfigMapList, secrets *v1.SecretList) []EnvVar {
+	vars := make([]EnvVar, 0)
+	for _, envFromVar := range container.EnvFrom {
+		switch {
+		case envFromVar.ConfigMapRef != nil:
+			name := envFromVar.ConfigMapRef.LocalObjectReference.Name
+			for _, configMap := range configMaps.Items {
+				if configMap.ObjectMeta.Name == name {
+					for key, value := range configMap.Data {
+						valueFrom := &v1.EnvVarSource{
+							ConfigMapKeyRef: &v1.ConfigMapKeySelector{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: name,
+								},
+								Key: key,
+							},
+						}
+						variable := EnvVar{
+							Name:      envFromVar.Prefix + key,
+							Value:     value,
+							ValueFrom: valueFrom,
+						}
+						vars = append(vars, variable)
+					}
+					break
+				}
+			}
+		case envFromVar.SecretRef != nil:
+			name := envFromVar.SecretRef.LocalObjectReference.Name
+			for _, secret := range secrets.Items {
+				if secret.ObjectMeta.Name == name {
+					for key, value := range secret.Data {
+						valueFrom := &v1.EnvVarSource{
+							SecretKeyRef: &v1.SecretKeySelector{
+								LocalObjectReference: v1.LocalObjectReference{
+									Name: name,
+								},
+								Key: key,
+							},
+						}
+						variable := EnvVar{
+							Name:      envFromVar.Prefix + key,
+							Value:     base64.StdEncoding.EncodeToString(value),
+							ValueFrom: valueFrom,
+						}
+						vars = append(vars, variable)
+					}
+					break
+				}
+			}
+		}
+	}
+	return vars
+}
+
+// evalValueFrom evaluates environment value from given source. For more details check:
+// https://github.com/kubernetes/kubernetes/blob/d82e51edc5f02bff39661203c9b503d054c3493b/pkg/kubectl/describe.go#L1056
+func evalValueFrom(src *v1.EnvVarSource, container *v1.Container, pod *v1.Pod,
+	configMaps *v1.ConfigMapList, secrets *v1.SecretList) string {
+	switch {
+	case src.ConfigMapKeyRef != nil:
+		name := src.ConfigMapKeyRef.LocalObjectReference.Name
 		for _, configMap := range configMaps.Items {
 			if configMap.ObjectMeta.Name == name {
 				return configMap.Data[src.ConfigMapKeyRef.Key]
 			}
 		}
+	case src.SecretKeyRef != nil:
+		name := src.SecretKeyRef.LocalObjectReference.Name
+		for _, secret := range secrets.Items {
+			if secret.ObjectMeta.Name == name {
+				return base64.StdEncoding.EncodeToString([]byte(
+					secret.Data[src.SecretKeyRef.Key]))
+			}
+		}
+	case src.ResourceFieldRef != nil:
+		valueFrom, err := extractContainerResourceValue(src.ResourceFieldRef, container)
+		if err != nil {
+			valueFrom = ""
+		}
+		resource := src.ResourceFieldRef.Resource
+		if valueFrom == "0" && (resource == "limits.cpu" || resource == "limits.memory") {
+			valueFrom = "node allocatable"
+		}
+		return valueFrom
+	case src.FieldRef != nil:
+		internalFieldPath, _, err := runtime.NewScheme().ConvertFieldLabel(src.FieldRef.APIVersion,
+			"Pod", src.FieldRef.FieldPath, "")
+		if err != nil {
+			log.Println(err)
+			return ""
+		}
+		valueFrom, err := ExtractFieldPathAsString(pod, internalFieldPath)
+		if err != nil {
+			log.Println(err)
+			return ""
+		}
+		return valueFrom
 	}
 	return ""
+}
+
+// extractContainerResourceValue extracts the value of a resource in an already known container.
+func extractContainerResourceValue(fs *v1.ResourceFieldSelector, container *v1.Container) (string,
+	error) {
+	divisor := res.Quantity{}
+	if divisor.Cmp(fs.Divisor) == 0 {
+		divisor = res.MustParse("1")
+	} else {
+		divisor = fs.Divisor
+	}
+
+	switch fs.Resource {
+	case "limits.cpu":
+		return strconv.FormatInt(int64(math.Ceil(float64(container.Resources.Limits.
+			Cpu().MilliValue())/float64(divisor.MilliValue()))), 10), nil
+	case "limits.memory":
+		return strconv.FormatInt(int64(math.Ceil(float64(container.Resources.Limits.
+			Memory().Value())/float64(divisor.Value()))), 10), nil
+	case "requests.cpu":
+		return strconv.FormatInt(int64(math.Ceil(float64(container.Resources.Requests.
+			Cpu().MilliValue())/float64(divisor.MilliValue()))), 10), nil
+	case "requests.memory":
+		return strconv.FormatInt(int64(math.Ceil(float64(container.Resources.Requests.
+			Memory().Value())/float64(divisor.Value()))), 10), nil
+	}
+
+	return "", fmt.Errorf("Unsupported container resource : %v", fs.Resource)
 }

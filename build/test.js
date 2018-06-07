@@ -1,4 +1,4 @@
-// Copyright 2015 Google Inc. All Rights Reserved.
+// Copyright 2017 The Kubernetes Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,12 +15,11 @@
 /**
  * @fileoverview Gulp tasks for unit and integration tests.
  */
+import childProcess from 'child_process';
 import gulp from 'gulp';
-import codecov from 'gulp-codecov.io';
 import gulpProtractor from 'gulp-protractor';
 import karma from 'karma';
 import path from 'path';
-
 import conf from './conf';
 import goCommand from './gocommand';
 import {browserSyncInstance} from './serve';
@@ -71,22 +70,12 @@ function runProtractorTests(doneFn) {
 /**
  * Runs once all unit tests of the application.
  */
-gulp.task('test', ['frontend-test', 'backend-test']);
-
-/**
- * Execute gulp-codecov task and uploads generated
- * coverage report to http://codecov.io. Should be used only
- * by external CI tools, as gulp-codecov plugin is already designed to work
- * with them. Does not work locally.
- */
-gulp.task('coverage-codecov-upload', function() {
-  gulp.src(path.join(conf.paths.coverageReport, 'lcov.info')).pipe(codecov());
-});
+gulp.task('test', ['frontend-test', 'backend-test-with-coverage']);
 
 /**
  * Runs once all unit tests of the frontend application.
  */
-gulp.task('frontend-test', function(doneFn) {
+gulp.task('frontend-test', ['set-test-node-env'], function(doneFn) {
   runFrontendUnitTests(true, doneFn);
 });
 
@@ -95,6 +84,25 @@ gulp.task('frontend-test', function(doneFn) {
  */
 gulp.task('backend-test', ['package-backend'], function(doneFn) {
   goCommand(conf.backend.testCommandArgs, doneFn);
+});
+
+/**
+ * Runs once all unit tests of the backend application with coverage report.
+ */
+gulp.task('backend-test-with-coverage', ['package-backend'], function(doneFn) {
+  let testProcess = childProcess.execFile(
+      conf.paths.goTestScript, [conf.paths.coverageBackend, conf.backend.mainPackageName]);
+
+  testProcess.stdout.pipe(process.stdout);
+  testProcess.stderr.pipe(process.stderr);
+
+  testProcess.on('close', (code) => {
+    if (code !== 0) {
+      return doneFn(new Error(`Process exited with code: ${code}`));
+    }
+
+    return doneFn();
+  });
 });
 
 /**
@@ -107,7 +115,7 @@ gulp.task('test:watch', ['frontend-test:watch', 'backend-test:watch']);
  * Runs frontend backend application tests. Watches for changes in the source files to rerun
  * the tests.
  */
-gulp.task('frontend-test:watch', function(doneFn) {
+gulp.task('frontend-test:watch', ['set-test-node-env'], function(doneFn) {
   runFrontendUnitTests(false, doneFn);
 });
 
@@ -128,13 +136,6 @@ gulp.task('integration-test', ['serve:nowatch', 'webdriver-update'], runProtract
  * Runs application integration tests. Uses production version of the application.
  */
 gulp.task('integration-test:prod', ['serve:prod', 'webdriver-update'], runProtractorTests);
-
-/**
- * Runs application integration tests. Uses production version of the application.
- */
-gulp.task(
-    'local-cluster-integration-test:prod', ['serve:prod', 'local-up-cluster', 'webdriver-update'],
-    runProtractorTests);
 
 /**
  * Downloads and updates webdriver. Required to keep it up to date.

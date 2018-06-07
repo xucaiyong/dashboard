@@ -1,4 +1,4 @@
-// Copyright 2015 Google Inc. All Rights Reserved.
+// Copyright 2017 The Kubernetes Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -38,10 +38,10 @@ function createConfig() {
 
   if (conf.test.useSauceLabs) {
     let name = `Integration tests ${process.env.TRAVIS_REPO_SLUG}, build ` +
-        `${process.env.TRAVIS_BUILD_NUMBER}`;
+        `${process.env.TRAVIS_BUILD_NUMBER}, job ${process.env.TRAVIS_JOB_NUMBER}`;
     if (process.env.TRAVIS_PULL_REQUEST !== 'false') {
       name += `, PR: https://github.com/${process.env.TRAVIS_REPO_SLUG}/pull/` +
-          `${process.env.TRAVIS_PULL_REQUEST}`;
+          `${process.env.TRAVIS_PULL_REQUEST}, job ${process.env.TRAVIS_JOB_NUMBER}`;
     }
 
     config.sauceUser = process.env.SAUCE_USERNAME;
